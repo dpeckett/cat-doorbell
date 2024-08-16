@@ -1,4 +1,8 @@
-address: tcp://localhost:1883
-username: user
-password: pass
-target_mac: 00:11:22:33:44:55
+apiVersion: catdoorbell.github.com/v1alpha1
+kind: Config
+broker:
+  address: tcp://localhost:1883
+  username: user
+  password: pass
+targetMAC: 00:11:22:33:44:55
+detectionTimeout: 5m

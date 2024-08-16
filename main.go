@@ -32,6 +32,8 @@ import (
 
 	"github.com/adrg/xdg"
 	"github.com/dpeckett/cat-doorbell/internal/assets"
+	"github.com/dpeckett/cat-doorbell/internal/config"
+	latestconfig "github.com/dpeckett/cat-doorbell/internal/config/v1alpha1"
 	"github.com/dpeckett/cat-doorbell/internal/constants"
 	"github.com/dpeckett/cat-doorbell/internal/util"
 	paho "github.com/eclipse/paho.mqtt.golang"
@@ -40,30 +42,24 @@ import (
 	"github.com/gopxl/beep/v2"
 	"github.com/gopxl/beep/v2/mp3"
 	"github.com/gopxl/beep/v2/speaker"
+	slogmulti "github.com/samber/slog-multi"
 	"github.com/urfave/cli/v2"
-	"gopkg.in/yaml.v3"
 )
 
 const (
-	detectionTimeout = 5 * time.Minute
-	mqttTopic        = "bluetooth/devices"
+	mqttTopic = "bluetooth/devices"
 )
-
-type Config struct {
-	// Address is the address of the MQTT broker.
-	Address string `yaml:"address"`
-	// Username is the username for authenticating with the MQTT broker.
-	Username string `yaml:"username"`
-	// Password is the password for authenticating with the MQTT broker.
-	Password string `yaml:"password"`
-	// TargetMAC is the MAC address of the device to listen for.
-	TargetMAC string `yaml:"target_mac"`
-}
 
 func main() {
 	defaultConfigFilePath, err := xdg.ConfigFile("cat-doorbell/config.yaml")
 	if err != nil {
 		slog.Error("Failed to get default configuration file path", slog.Any("error", err))
+		os.Exit(1)
+	}
+
+	defaultLogDir, err := xdg.StateFile("cat-doorbell/logs")
+	if err != nil {
+		slog.Error("Failed to get state directory", slog.Any("error", err))
 		os.Exit(1)
 	}
 
@@ -74,6 +70,11 @@ func main() {
 			Usage:   "Path to the configuration file",
 			Value:   defaultConfigFilePath,
 		},
+		&cli.StringFlag{
+			Name:  "log-dir",
+			Usage: "Directory to store log files",
+			Value: defaultLogDir,
+		},
 		&cli.GenericFlag{
 			Name:  "log-level",
 			Usage: "Set the log verbosity level",
@@ -82,21 +83,46 @@ func main() {
 	}
 
 	initLogger := func(c *cli.Context) error {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		logDir := c.String("log-dir")
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			slog.Error("Failed to create state directory", slog.Any("error", err))
+			os.Exit(1)
+		}
+
+		if err := removeOldLogs(logDir); err != nil {
+			return fmt.Errorf("failed to remove old logs: %w", err)
+		}
+
+		logFileName := fmt.Sprintf("%d-%d-cat-doorbell.log", time.Now().Unix(), os.Getpid())
+		logFile, err := os.OpenFile(filepath.Join(logDir, logFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return fmt.Errorf("failed to open log file: %w", err)
+		}
+
+		opts := &slog.HandlerOptions{
 			Level: (*slog.Level)(c.Generic("log-level").(*util.LevelFlag)),
-		})))
+		}
+
+		slog.SetDefault(slog.New(
+			slogmulti.Fanout(
+				slog.NewTextHandler(logFile, opts),
+				slog.NewTextHandler(os.Stderr, opts),
+			),
+		))
 
 		return nil
 	}
 
-	var conf Config
+	var conf *latestconfig.Config
 	loadConfig := func(c *cli.Context) error {
-		configYAML, err := os.ReadFile(c.String("config"))
+		configFile, err := os.Open(c.String("config"))
 		if err != nil {
-			return fmt.Errorf("failed to read configuration file: %w", err)
+			return fmt.Errorf("failed to open configuration file: %w", err)
 		}
+		defer configFile.Close()
 
-		if err := yaml.Unmarshal(configYAML, &conf); err != nil {
+		conf, err = config.FromYAML(configFile)
+		if err != nil {
 			return fmt.Errorf("failed to unmarshal configuration: %w", err)
 		}
 
@@ -142,7 +168,7 @@ func main() {
 				go func() {
 					defer systray.Quit()
 
-					err = run(ctx, &conf)
+					err = run(ctx, conf)
 				}()
 			}, cancel)
 
@@ -156,7 +182,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, conf *Config) error {
+func run(ctx context.Context, conf *latestconfig.Config) error {
 	hostname, err := os.Hostname()
 	if err != nil {
 		return fmt.Errorf("failed to get hostname: %w", err)
@@ -164,13 +190,13 @@ func run(ctx context.Context, conf *Config) error {
 
 	// Configure MQTT client
 	opts := paho.NewClientOptions().
-		AddBroker(conf.Address).
-		SetClientID(hostname).
-		SetUsername(conf.Username).
-		SetPassword(conf.Password)
+		AddBroker(conf.Broker.Address).
+		SetClientID(fmt.Sprintf("%s-%d", hostname, os.Getpid())).
+		SetUsername(conf.Broker.Username).
+		SetPassword(conf.Broker.Password)
 
 	opts.OnConnect = func(client paho.Client) {
-		slog.Info("Connected to MQTT broker", slog.String("address", conf.Address))
+		slog.Info("Connected to MQTT broker", slog.String("address", conf.Broker.Address))
 	}
 
 	opts.OnConnectionLost = func(_ paho.Client, err error) {
@@ -182,6 +208,12 @@ func run(ctx context.Context, conf *Config) error {
 		return fmt.Errorf("failed to connect to MQTT broker: %w", token.Error())
 	}
 	defer client.Disconnect(250)
+
+	// Initialize the speaker.
+	sr := beep.SampleRate(44100)
+	if err := speaker.Init(sr, sr.N(time.Second/10)); err != nil {
+		return fmt.Errorf("failed to initialize speaker: %w", err)
+	}
 
 	var lastDetectedMu sync.Mutex
 	var lastDetected time.Time
@@ -207,7 +239,7 @@ func run(ctx context.Context, conf *Config) error {
 			lastDetectedMu.Lock()
 			defer lastDetectedMu.Unlock()
 
-			if time.Since(lastDetected) >= detectionTimeout {
+			if time.Since(lastDetected) >= conf.DetectionTimeout {
 				lastDetected = time.Now()
 
 				slog.Info("Detected target device", slog.String("mac", mac))
@@ -234,16 +266,10 @@ func run(ctx context.Context, conf *Config) error {
 }
 
 func playDoorbell() error {
-	sr := beep.SampleRate(44100)
-	if err := speaker.Init(sr, sr.N(time.Second/10)); err != nil {
-		return fmt.Errorf("failed to initialize speaker: %w", err)
-	}
-
 	f, err := assets.Open("doorbell.mp3")
 	if err != nil {
 		return fmt.Errorf("failed to open embedded sound asset: %w", err)
 	}
-	defer f.Close()
 
 	s, _, err := mp3.Decode(f)
 	if err != nil {
@@ -251,9 +277,26 @@ func playDoorbell() error {
 	}
 
 	speaker.Play(beep.Seq(s, beep.Callback(func() {
+		_ = f.Close()
 		_ = s.Close()
-		speaker.Close()
 	})))
+
+	return nil
+}
+
+func removeOldLogs(logDir string) error {
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return fmt.Errorf("failed to read logs directory: %w", err)
+	}
+
+	if len(entries) > 10 {
+		for _, entry := range entries[:len(entries)-10] {
+			if err := os.Remove(filepath.Join(logDir, entry.Name())); err != nil {
+				return fmt.Errorf("failed to remove old log entry: %w", err)
+			}
+		}
+	}
 
 	return nil
 }
