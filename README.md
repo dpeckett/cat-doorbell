@@ -7,6 +7,22 @@ closed up and the cat is trying to enter through a different room, it's very
 easy to miss the sound. This project is a simple way to get a notification when
 the cat is at the door.
 
+## Build
+
+### Debian
+
+```shell
+sudo apt install libasound2-dev libgtk-3-dev libayatana-appindicator3-dev
+go build
+```
+
+### MacOS
+
+```shell
+brew install create-dmg
+./build-darwin.sh
+```
+
 ## Usage
 
 To receive a notification when the MAC address `AA:BB:CC:DD:EE:FF` is detected

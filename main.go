@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/adrg/xdg"
 	"github.com/dpeckett/cat-doorbell/internal/assets"
 	"github.com/dpeckett/cat-doorbell/internal/constants"
 	"github.com/dpeckett/cat-doorbell/internal/util"
@@ -40,6 +41,7 @@ import (
 	"github.com/gopxl/beep/v2/mp3"
 	"github.com/gopxl/beep/v2/speaker"
 	"github.com/urfave/cli/v2"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -47,8 +49,31 @@ const (
 	mqttTopic        = "bluetooth/devices"
 )
 
+type Config struct {
+	// Address is the address of the MQTT broker.
+	Address string `yaml:"address"`
+	// Username is the username for authenticating with the MQTT broker.
+	Username string `yaml:"username"`
+	// Password is the password for authenticating with the MQTT broker.
+	Password string `yaml:"password"`
+	// TargetMAC is the MAC address of the device to listen for.
+	TargetMAC string `yaml:"target_mac"`
+}
+
 func main() {
+	defaultConfigFilePath, err := xdg.ConfigFile("cat-doorbell/config.yaml")
+	if err != nil {
+		slog.Error("Failed to get default configuration file path", slog.Any("error", err))
+		os.Exit(1)
+	}
+
 	persistentFlags := []cli.Flag{
+		&cli.StringFlag{
+			Name:    "config",
+			Aliases: []string{"c"},
+			Usage:   "Path to the configuration file",
+			Value:   defaultConfigFilePath,
+		},
 		&cli.GenericFlag{
 			Name:  "log-level",
 			Usage: "Set the log verbosity level",
@@ -64,39 +89,29 @@ func main() {
 		return nil
 	}
 
+	var conf Config
+	loadConfig := func(c *cli.Context) error {
+		configYAML, err := os.ReadFile(c.String("config"))
+		if err != nil {
+			return fmt.Errorf("failed to read configuration file: %w", err)
+		}
+
+		if err := yaml.Unmarshal(configYAML, &conf); err != nil {
+			return fmt.Errorf("failed to unmarshal configuration: %w", err)
+		}
+
+		return nil
+	}
+
 	app := &cli.App{
 		Name:    "cat-doorbell",
 		Usage:   "Receive a notification when the cat wants to come inside",
 		Version: constants.Version,
-		Flags: append([]cli.Flag{
-			&cli.StringFlag{
-				Name:     "address",
-				Aliases:  []string{"a"},
-				Usage:    "The address of the MQTT broker",
-				Required: true,
-			},
-			&cli.StringFlag{
-				Name:     "username",
-				Aliases:  []string{"u"},
-				Usage:    "MQTT username for authentication",
-				Required: true,
-			},
-			&cli.StringFlag{
-				Name:     "password",
-				Aliases:  []string{"p"},
-				Usage:    "MQTT password for authentication",
-				Required: true,
-			},
-			&cli.StringFlag{
-				Name:     "target-mac",
-				Aliases:  []string{"m"},
-				Usage:    "The MAC address of the device to listen for",
-				Required: true,
-			},
-		}, persistentFlags...),
-		Before: initLogger,
+		Flags:   persistentFlags,
+		Before:  beforeAll(initLogger, loadConfig),
 		Action: func(c *cli.Context) error {
 			ctx, cancel := context.WithCancel(c.Context)
+			defer cancel()
 
 			var err error
 			systray.Run(func() {
@@ -127,7 +142,7 @@ func main() {
 				go func() {
 					defer systray.Quit()
 
-					err = run(ctx, c.String("address"), c.String("username"), c.String("password"), c.String("target-mac"))
+					err = run(ctx, &conf)
 				}()
 			}, cancel)
 
@@ -141,7 +156,7 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, address, username, password, targetMAC string) error {
+func run(ctx context.Context, conf *Config) error {
 	hostname, err := os.Hostname()
 	if err != nil {
 		return fmt.Errorf("failed to get hostname: %w", err)
@@ -149,13 +164,13 @@ func run(ctx context.Context, address, username, password, targetMAC string) err
 
 	// Configure MQTT client
 	opts := paho.NewClientOptions().
-		AddBroker(address).
+		AddBroker(conf.Address).
 		SetClientID(hostname).
-		SetUsername(username).
-		SetPassword(password)
+		SetUsername(conf.Username).
+		SetPassword(conf.Password)
 
-	opts.OnConnect = func(_ paho.Client) {
-		slog.Info("Connected to MQTT broker", slog.String("address", address))
+	opts.OnConnect = func(client paho.Client) {
+		slog.Info("Connected to MQTT broker", slog.String("address", conf.Address))
 	}
 
 	opts.OnConnectionLost = func(_ paho.Client, err error) {
@@ -188,7 +203,7 @@ func run(ctx context.Context, address, username, password, targetMAC string) err
 
 		slog.Debug("Received beacon from device", slog.String("mac", mac))
 
-		if strings.EqualFold(mac, targetMAC) {
+		if strings.EqualFold(mac, conf.TargetMAC) {
 			lastDetectedMu.Lock()
 			defer lastDetectedMu.Unlock()
 
@@ -241,4 +256,16 @@ func playDoorbell() error {
 	})))
 
 	return nil
+}
+
+func beforeAll(beforeFunc ...cli.BeforeFunc) cli.BeforeFunc {
+	return func(c *cli.Context) error {
+		for _, f := range beforeFunc {
+			if err := f(c); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
 }

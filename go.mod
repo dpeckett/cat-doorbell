@@ -3,11 +3,13 @@ module github.com/dpeckett/cat-doorbell
 go 1.22.0
 
 require (
+	github.com/adrg/xdg v0.5.0
 	github.com/eclipse/paho.mqtt.golang v1.5.0
 	github.com/gen2brain/beeep v0.0.0-20240516210008-9c006672e7f4
 	github.com/getlantern/systray v1.2.2
 	github.com/gopxl/beep/v2 v2.0.2
 	github.com/urfave/cli/v2 v2.27.4
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

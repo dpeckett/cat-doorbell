@@ -8,6 +8,7 @@
 *.dll
 *.so
 *.dylib
+*.dmg
 
 # Test binary, built with `go test -c`
 *.test
@@ -24,3 +25,9 @@ go.work.sum
 
 # env file
 .env
+
+# MacOS files
+.DS_Store
+
+# Config files
+/config.yaml
