@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Exec=/usr/local/bin/cat-doorbell
+Hidden=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+Name=Cat Doorbell
+Comment=Starts Cat Doorbell at login

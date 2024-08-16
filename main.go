@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -42,8 +43,10 @@ import (
 	"github.com/gopxl/beep/v2"
 	"github.com/gopxl/beep/v2/mp3"
 	"github.com/gopxl/beep/v2/speaker"
+	"github.com/pkg/browser"
 	slogmulti "github.com/samber/slog-multi"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -62,6 +65,8 @@ func main() {
 		slog.Error("Failed to get state directory", slog.Any("error", err))
 		os.Exit(1)
 	}
+
+	logFileName := fmt.Sprintf("%d-%d-cat-doorbell.log", time.Now().Unix(), os.Getpid())
 
 	persistentFlags := []cli.Flag{
 		&cli.StringFlag{
@@ -93,7 +98,6 @@ func main() {
 			return fmt.Errorf("failed to remove old logs: %w", err)
 		}
 
-		logFileName := fmt.Sprintf("%d-%d-cat-doorbell.log", time.Now().Unix(), os.Getpid())
 		logFile, err := os.OpenFile(filepath.Join(logDir, logFileName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			return fmt.Errorf("failed to open log file: %w", err)
@@ -137,9 +141,8 @@ func main() {
 		Before:  beforeAll(initLogger, loadConfig),
 		Action: func(c *cli.Context) error {
 			ctx, cancel := context.WithCancel(c.Context)
-			defer cancel()
+			g, ctx := errgroup.WithContext(ctx)
 
-			var err error
 			systray.Run(func() {
 				var iconData []byte
 				iconData, err = assets.ReadFile("cat-icon.png")
@@ -151,28 +154,51 @@ func main() {
 				systray.SetIcon(iconData)
 				systray.SetTooltip("Doorbell")
 
+				mViewConfig := systray.AddMenuItem("View Config", "View the application configuration")
+				mViewLogs := systray.AddMenuItem("View Logs", "View the application logs")
 				mQuit := systray.AddMenuItem("Quit", "Quit the application")
 
 				sig := make(chan os.Signal, 1)
 				signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 
-				go func() {
-					select {
-					case <-mQuit.ClickedCh:
-						systray.Quit()
-					case <-sig:
-						systray.Quit()
-					}
-				}()
-
-				go func() {
+				g.Go(func() error {
 					defer systray.Quit()
 
-					err = run(ctx, conf)
-				}()
+					for {
+						select {
+						case <-mViewConfig.ClickedCh:
+							slog.Info("User requested to view configuration")
+
+							if err := browser.OpenFile(c.String("config")); err != nil {
+								slog.Warn("Failed to open configuration file", slog.Any("error", err))
+							}
+						case <-mViewLogs.ClickedCh:
+							slog.Info("User requested to view logs")
+
+							logDir := c.String("log-dir")
+							if err := browser.OpenFile(filepath.Join(logDir, logFileName)); err != nil {
+								slog.Warn("Failed to open log file", slog.Any("error", err))
+							}
+						case <-mQuit.ClickedCh:
+							slog.Info("User requested shutdown")
+							return nil
+						case <-sig:
+							slog.Info("Received signal, shutting down")
+							return nil
+						}
+					}
+				})
+
+				g.Go(func() error {
+					return run(ctx, conf)
+				})
 			}, cancel)
 
-			return err
+			if err := g.Wait(); err != nil && !errors.Is(err, context.Canceled) {
+				return err
+			}
+
+			return nil
 		},
 	}
 

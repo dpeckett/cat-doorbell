@@ -46,6 +46,11 @@ Log out and back in, then enable the extension:
 gnome-extensions enable ubuntu-appindicators@ubuntu.com
 ```
 
+```shell
+mkdir -p ~/.config/autostart
+install -m 755 linux/CatDoorbell.desktop ~/.config/autostart
+```
+
 ## Bluetooth Receiver Setup
 
 You'll need a machine to act as the Bluetooth receiver. I'm using an old intel
