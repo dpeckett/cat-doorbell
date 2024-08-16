@@ -19,12 +19,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/dpeckett/cat-doorbell/internal/assets"
@@ -32,6 +35,7 @@ import (
 	"github.com/dpeckett/cat-doorbell/internal/util"
 	paho "github.com/eclipse/paho.mqtt.golang"
 	"github.com/gen2brain/beeep"
+	"github.com/getlantern/systray"
 	"github.com/gopxl/beep/v2"
 	"github.com/gopxl/beep/v2/mp3"
 	"github.com/gopxl/beep/v2/speaker"
@@ -92,81 +96,42 @@ func main() {
 		}, persistentFlags...),
 		Before: initLogger,
 		Action: func(c *cli.Context) error {
-			hostname, err := os.Hostname()
-			if err != nil {
-				return fmt.Errorf("failed to get hostname: %w", err)
-			}
+			ctx, cancel := context.WithCancel(c.Context)
 
-			// Configure MQTT client
-			address := c.String("address")
-			opts := paho.NewClientOptions().
-				AddBroker(address).
-				SetClientID(hostname).
-				SetUsername(c.String("username")).
-				SetPassword(c.String("password"))
-
-			opts.OnConnect = func(_ paho.Client) {
-				slog.Info("Connected to MQTT broker", slog.String("address", address))
-			}
-
-			opts.OnConnectionLost = func(_ paho.Client, err error) {
-				slog.Warn("Lost connection to MQTT broker", slog.Any("error", err))
-			}
-
-			client := paho.NewClient(opts)
-			if token := client.Connect(); token.Wait() && token.Error() != nil {
-				return fmt.Errorf("failed to connect to MQTT broker: %w", token.Error())
-			}
-			defer client.Disconnect(250)
-
-			var lastDetectedMu sync.Mutex
-			var lastDetected time.Time
-
-			// Unpack the notification icon.
-			tempDir, err := os.MkdirTemp("", "cat-doorbell")
-			if err != nil {
-				return fmt.Errorf("failed to create temporary directory: %w", err)
-			}
-			defer os.RemoveAll(tempDir)
-
-			catIconPath := filepath.Join(tempDir, "cat-icon.png")
-			if err := assets.Unpack("cat-icon.png", catIconPath); err != nil {
-				return fmt.Errorf("failed to unpack cat icon: %w", err)
-			}
-
-			if token := client.Subscribe(mqttTopic, 0, func(client paho.Client, msg paho.Message) {
-				mac := string(msg.Payload())
-
-				slog.Debug("Received beacon from device", slog.String("mac", mac))
-
-				if strings.EqualFold(mac, c.String("target-mac")) {
-					lastDetectedMu.Lock()
-					defer lastDetectedMu.Unlock()
-
-					if time.Since(lastDetected) >= detectionTimeout {
-						lastDetected = time.Now()
-
-						slog.Info("Detected target device", slog.String("mac", mac))
-
-						message := fmt.Sprintf("Device %s came into range", mac)
-						if err := beeep.Notify("Doorbell", message, catIconPath); err != nil {
-							slog.Warn("Failed to raise notification", slog.Any("error", err))
-						}
-
-						if err := playDoorbellSound(); err != nil {
-							slog.Warn("Failed to play doorbell sound", slog.Any("error", err))
-						}
-					} else {
-						slog.Debug("Ignoring beacon from device", slog.String("mac", mac))
-					}
+			var err error
+			systray.Run(func() {
+				var iconData []byte
+				iconData, err = assets.ReadFile("cat-icon.png")
+				if err != nil {
+					systray.Quit()
+					return
 				}
-			}); token.Wait() && token.Error() != nil {
-				return fmt.Errorf("failed to subscribe to MQTT topic: %w", token.Error())
-			}
 
-			<-c.Context.Done()
+				systray.SetIcon(iconData)
+				systray.SetTooltip("Doorbell")
 
-			return nil
+				mQuit := systray.AddMenuItem("Quit", "Quit the application")
+
+				sig := make(chan os.Signal, 1)
+				signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+
+				go func() {
+					select {
+					case <-mQuit.ClickedCh:
+						systray.Quit()
+					case <-sig:
+						systray.Quit()
+					}
+				}()
+
+				go func() {
+					defer systray.Quit()
+
+					err = run(ctx, c.String("address"), c.String("username"), c.String("password"), c.String("target-mac"))
+				}()
+			}, cancel)
+
+			return err
 		},
 	}
 
@@ -176,7 +141,84 @@ func main() {
 	}
 }
 
-func playDoorbellSound() error {
+func run(ctx context.Context, address, username, password, targetMAC string) error {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("failed to get hostname: %w", err)
+	}
+
+	// Configure MQTT client
+	opts := paho.NewClientOptions().
+		AddBroker(address).
+		SetClientID(hostname).
+		SetUsername(username).
+		SetPassword(password)
+
+	opts.OnConnect = func(_ paho.Client) {
+		slog.Info("Connected to MQTT broker", slog.String("address", address))
+	}
+
+	opts.OnConnectionLost = func(_ paho.Client, err error) {
+		slog.Warn("Lost connection to MQTT broker", slog.Any("error", err))
+	}
+
+	client := paho.NewClient(opts)
+	if token := client.Connect(); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("failed to connect to MQTT broker: %w", token.Error())
+	}
+	defer client.Disconnect(250)
+
+	var lastDetectedMu sync.Mutex
+	var lastDetected time.Time
+
+	// Unpack the notification icon.
+	tempDir, err := os.MkdirTemp("", "cat-doorbell")
+	if err != nil {
+		return fmt.Errorf("failed to create temporary directory: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	catIconPath := filepath.Join(tempDir, "cat-icon.png")
+	if err := assets.Unpack("cat-icon.png", catIconPath); err != nil {
+		return fmt.Errorf("failed to unpack cat icon: %w", err)
+	}
+
+	if token := client.Subscribe(mqttTopic, 0, func(client paho.Client, msg paho.Message) {
+		mac := string(msg.Payload())
+
+		slog.Debug("Received beacon from device", slog.String("mac", mac))
+
+		if strings.EqualFold(mac, targetMAC) {
+			lastDetectedMu.Lock()
+			defer lastDetectedMu.Unlock()
+
+			if time.Since(lastDetected) >= detectionTimeout {
+				lastDetected = time.Now()
+
+				slog.Info("Detected target device", slog.String("mac", mac))
+
+				message := fmt.Sprintf("Device %s came into range", mac)
+				if err := beeep.Notify("Doorbell", message, catIconPath); err != nil {
+					slog.Warn("Failed to raise notification", slog.Any("error", err))
+				}
+
+				if err := playDoorbell(); err != nil {
+					slog.Warn("Failed to play doorbell sound", slog.Any("error", err))
+				}
+			} else {
+				slog.Debug("Ignoring beacon from device", slog.String("mac", mac))
+			}
+		}
+	}); token.Wait() && token.Error() != nil {
+		return fmt.Errorf("failed to subscribe to MQTT topic: %w", token.Error())
+	}
+
+	<-ctx.Done()
+
+	return ctx.Err()
+}
+
+func playDoorbell() error {
 	sr := beep.SampleRate(44100)
 	if err := speaker.Init(sr, sr.N(time.Second/10)); err != nil {
 		return fmt.Errorf("failed to initialize speaker: %w", err)

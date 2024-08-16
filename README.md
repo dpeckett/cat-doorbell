@@ -16,6 +16,20 @@ by the Bluetooth receiver, run the following command:
 ./cat-doorbell -a tcp://doorbell-receiver:1883 -u cat-doorbell -p mypassword -m AA:BB:CC:DD:EE:FF
 ```
 
+### Debian System Tray
+
+To run the program in the system tray on Debian, you can use the following:
+
+```shell
+sudo apt install gnome-shell-extension-appindicator
+```
+
+Log out and back in, then enable the extension:
+
+```shell
+gnome-extensions enable ubuntu-appindicators@ubuntu.com
+```
+
 ## Bluetooth Receiver Setup
 
 You'll need a machine to act as the Bluetooth receiver. I'm using an old intel

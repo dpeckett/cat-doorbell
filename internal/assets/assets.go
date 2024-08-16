@@ -34,6 +34,11 @@ func Open(name string) (fs.File, error) {
 	return fsys.Open(filepath.Join("files", name))
 }
 
+// ReadFile reads the file with the given name from the embedded filesystem.
+func ReadFile(name string) ([]byte, error) {
+	return fs.ReadFile(fsys, filepath.Join("files", name))
+}
+
 // Unpack extracts the file with the given name from the embedded filesystem to the given path.
 func Unpack(name, path string) error {
 	f, err := Open(name)
